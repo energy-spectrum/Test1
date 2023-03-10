@@ -128,6 +128,10 @@ func solve(store sqlc_db.Store) {
 		}
 	}
 
+	fmt.Println("=+=+=+=")
+	fmt.Printf("Страница сборки заказов %s\n", os.Args[1])
+	fmt.Println()
+
 	for rackName, listPartOrder := range racks {
 		fmt.Printf("===Стеллаж %s\n", rackName)
 		for _, partOrder := range listPartOrder {
