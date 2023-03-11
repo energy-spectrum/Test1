@@ -5,18 +5,17 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 
 	"app/bootstrap"
-	"app/db"
-	sqlc_db "app/db/sqlc"
 )
 
 func main() {
@@ -24,24 +23,27 @@ func main() {
 
 	env := bootstrap.NewEnv()
 
-	db, store := connectToDB(env)
+	db := connectToDB(env)
 
 	DBName := env.DBDriver
 	runDBMigration(db, DBName, env.MigrationURL)
 
-	solve(store)
+	solve(db)
 }
 
-func connectToDB(env *bootstrap.Env) (*sql.DB, sqlc_db.Store) {
+func connectToDB(env *bootstrap.Env) *sql.DB {
 	logrus.Print(env.DBSource)
-	db, err := db.Connect(env.DBDriver, env.DBSource)
+	db, err := sql.Open(env.DBDriver, env.DBSource)
+	if err != nil {
+		logrus.Fatalf("failed to connect to Postgresql: %v", err)
+	}
+	err = db.Ping()
 	if err != nil {
 		logrus.Fatalf("failed to connect to Postgresql: %v", err)
 	}
 	logrus.Infof("connected to Postgresql")
 
-	store := sqlc_db.NewStore(db)
-	return db, store
+	return db
 }
 
 func runDBMigration(db *sql.DB, DBname, migrationURL string) {
@@ -62,38 +64,48 @@ func runDBMigration(db *sql.DB, DBname, migrationURL string) {
 	logrus.Printf("db migrated successfully")
 }
 
-type Product struct {
-	ID             int64
-	Name           string
-	Quantity       int
-	SecondaryRacks []string
-}
-
 type PartOrder struct {
-	ID      int64
-	Product *Product
+	OrderID  int64
+	Product  *Product
+	Quantity int
 }
 
-func solve(store sqlc_db.Store) {
+type Product struct {
+	ID   int64
+	Name string
+}
+
+var mainRacks map[int64]string
+var secondaryRacks map[int64][]string
+
+func solve(db *sql.DB) {
 	ctx := context.Background()
 
 	orderIDs := parseOrderIDs(os.Args[1])
 
-	orders, err := getOrders(ctx, store, orderIDs)
+	mainRacks = make(map[int64]string)
+	secondaryRacks = make(map[int64][]string)
+
+	orders, err := getOrders(db, ctx, orderIDs)
 	if err != nil {
 		logrus.Fatalf(err.Error())
 	}
 
-	racks, err := groupOrdersByRack(ctx, store, orders)
+	err = initRacks(db, ctx)
 	if err != nil {
 		logrus.Fatalf(err.Error())
 	}
 
-	printRacksAndOrders(racks, orders)
+	racks, err := groupOrdersByRack(db, ctx, orders)
+	if err != nil {
+		logrus.Fatalf(err.Error())
+	}
+
+	printRacksAndOrders(racks)
 }
 
 func parseOrderIDs(orderIDsStr string) []int64 {
-	orderIDs := []int64{}
+	orderIDs := make([]int64, 0)
 	for _, orderIDStr := range strings.Split(orderIDsStr, ",") {
 		orderID, _ := strconv.ParseInt(orderIDStr, 10, 64)
 		orderIDs = append(orderIDs, orderID)
@@ -101,93 +113,114 @@ func parseOrderIDs(orderIDsStr string) []int64 {
 	return orderIDs
 }
 
-func getOrders(ctx context.Context, store sqlc_db.Store, orderIDs []int64) (map[int64][]*Product, error) {
-	orders := make(map[int64][]*Product)
-	for _, orderID := range orderIDs {
-		ordersSQLC, err := store.GetOrder(ctx, orderID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get order with ID %d: %v", orderID, err)
-		}
-
-		products := make([]*Product, 0, len(ordersSQLC))
-		for _, sqlcOrder := range ordersSQLC {
-			productName, err := getProductName(ctx, store, sqlcOrder.ProductID)
-			if err != nil {
-				return nil, err
-			}
-
-			products = append(products, &Product{
-				ID:       sqlcOrder.ProductID,
-				Name:     productName,
-				Quantity: int(sqlcOrder.Quantity),
-			})
-		}
-		orders[orderID] = products
+func getOrders(db *sql.DB, ctx context.Context, orderIDs []int64) (map[int64][]*PartOrder, error) {
+	const getOrdersQuery = `
+SELECT o.id, o.product_id, o.quantity, p.name
+FROM orders o
+JOIN products p ON p.id = o.product_id
+WHERE o.id = ANY($1)
+`
+	rows, err := db.QueryContext(ctx, getOrdersQuery, pq.Array(orderIDs))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query orders: %v", err)
 	}
+	defer rows.Close()
+
+	orders := make(map[int64][]*PartOrder)
+	for rows.Next() {
+		var partOrder PartOrder = PartOrder{
+			Product: &Product{},
+		}
+
+		err := rows.Scan(&partOrder.OrderID, &partOrder.Product.ID, &partOrder.Quantity, &partOrder.Product.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan order row: %v", err)
+		}
+
+		orders[partOrder.OrderID] = append(orders[partOrder.OrderID], &partOrder)
+		mainRacks[partOrder.Product.ID] = ""
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate order rows: %v", err)
+	}
+
 	return orders, nil
 }
 
-var productsName map[int64]string = make(map[int64]string, 0)
+func initRacks(db *sql.DB, ctx context.Context) error {
+	productIDs := make([]int64, 0, len(mainRacks))
+	for productID := range mainRacks {
+		productIDs = append(productIDs, productID)
+	}
 
-func getProductName(ctx context.Context, store sqlc_db.Store, id int64) (string, error) {
-	if name, ok := productsName[id]; ok {
-		return name, nil
-	} else {
-		productSQLC, err := store.GetProduct(ctx, id)
-		if err != nil {
-			return "", fmt.Errorf("failed to get product %d: %v", id, err)
+	const getRacksQuery = `
+SELECT product_id, name, is_main
+FROM racks
+WHERE product_id = ANY($1)
+`
+
+	rows, err := db.QueryContext(ctx, getRacksQuery, pq.Array(productIDs))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var productID int64
+		var rackName string
+		var isMain bool
+		if err := rows.Scan(&productID, &rackName, &isMain); err != nil {
+			return err
 		}
 
-		productsName[id] = productSQLC.Name
-		return productsName[id], nil
+		if isMain {
+			mainRacks[productID] = rackName
+		} else {
+			secondaryRacks[productID] = append(secondaryRacks[productID], rackName)
+		}
 	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func groupOrdersByRack(ctx context.Context, store sqlc_db.Store, orders map[int64][]*Product) (map[string][]PartOrder, error) {
-	racks := make(map[string][]PartOrder)
+func groupOrdersByRack(db *sql.DB, ctx context.Context, orders map[int64][]*PartOrder) (map[string][]*PartOrder, error) {
+	racks := make(map[string][]*PartOrder)
 
-	for orderID, products := range orders {
-		for _, product := range products {
-			rack, err := store.GetMainRack(ctx, product.ID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get main rack for product %d: %v", product.ID, err)
-			}
-
-			racks[rack.Name] = append(racks[rack.Name], PartOrder{
-				ID:      orderID,
-				Product: product,
-			})
-
-			secondaryRacks, err := store.GetSecondaryRacks(ctx, product.ID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get secondary racks for product %d: %v", product.ID, err)
-			}
-
-			for _, secondaryRack := range secondaryRacks {
-				product.SecondaryRacks = append(product.SecondaryRacks, secondaryRack.Name)
-			}
+	for _, listPartsOrder := range orders {
+		for _, partOrder := range listPartsOrder {
+			rackName := mainRacks[partOrder.Product.ID]
+			racks[rackName] = append(racks[rackName], partOrder)
 		}
 	}
 
 	return racks, nil
 }
 
-func printRacksAndOrders(racks map[string][]PartOrder, orders map[int64][]*Product) {
+func printRacksAndOrders(racks map[string][]*PartOrder) {
 	fmt.Println("=+=+=+=")
 
-	for rackName, listPartOrder := range racks {
+	racksNames := getSortedRacksNames(racks)
+
+	for _, rackName := range racksNames {
 		fmt.Printf("===Стеллаж %s\n", rackName)
-		for _, partOrder := range listPartOrder {
-			orderID := partOrder.ID
+
+		listPartsOrder := racks[rackName]
+		for _, partOrder := range listPartsOrder {
+			orderID := partOrder.OrderID
 			product := partOrder.Product
 
 			fmt.Printf("%s (id=%d)\n", product.Name, product.ID)
-			fmt.Printf("заказ %d, %d шт\n", orderID, product.Quantity)
+			fmt.Printf("заказ %d, %d шт\n", orderID, partOrder.Quantity)
 
-			if len(product.SecondaryRacks) > 0 {
+			if len(secondaryRacks[product.ID]) > 0 {
 				fmt.Printf("доп стеллаж: ")
 				listAdditionalRacksStr := ""
-				for _, secondaryRack := range product.SecondaryRacks {
+				for _, secondaryRack := range secondaryRacks[product.ID] {
 					listAdditionalRacksStr += secondaryRack + ","
 				}
 				fmt.Println(listAdditionalRacksStr[:len(listAdditionalRacksStr)-1])
@@ -196,4 +229,14 @@ func printRacksAndOrders(racks map[string][]PartOrder, orders map[int64][]*Produ
 			fmt.Println()
 		}
 	}
+}
+
+func getSortedRacksNames(racks map[string][]*PartOrder) []string{
+	racksNames := make([]string, 0, len(racks))
+	for rackName := range racks{
+		racksNames = append(racksNames, rackName)
+	}
+	sort.Strings(racksNames)
+
+	return racksNames
 }
