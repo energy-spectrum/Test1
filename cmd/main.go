@@ -126,10 +126,9 @@ func parseOrderIDs(orderIDsStr string) []int {
 
 func getOrders(db *sql.DB, ctx context.Context, orderIDs []int) (map[int]PartOrderList, error) {
 	const getOrdersQuery = `
-SELECT o.order_id, o.product_id, o.quantity
-FROM order_product o
-JOIN product p ON p.product_id = o.product_id
-WHERE o.order_id = ANY($1)
+SELECT order_id, product_id, quantity
+FROM order_product
+WHERE order_id = ANY($1)
 `
 	rows, err := db.QueryContext(ctx, getOrdersQuery, pq.Array(orderIDs))
 	if err != nil {
